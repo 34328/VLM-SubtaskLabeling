@@ -21,9 +21,9 @@ except ImportError:
 # ==========================
 # 默认配置（可被 sidebar 覆盖）
 # ==========================
-VIDEO_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/episode_videos/head"
-ORIG_META_PATH = "/home/unitree/桌面/VLM-SubtaskLabeling/galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl"
-OUTPUT_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/opt"
+VIDEO_DIR = "/home/unitree/桌面/label_task/episode_videos/head"
+ORIG_META_PATH = "/home/unitree/桌面/label_task/galaxea_subtask_label/part1_r1_lite/results_cleaned.json"
+OUTPUT_DIR = "/home/unitree/桌面/label_task/opt"
 
 
 # ==========================
