@@ -5,7 +5,7 @@ import ast
 import copy
 import re
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import base64 
 import streamlit as st
@@ -21,18 +21,94 @@ except ImportError:
 # ==========================
 # 默认配置（可被 sidebar 覆盖）
 # ==========================
-VIDEO_DIR = "/home/unitree/桌面/label_task/episode_videos/head"
-ORIG_META_PATH = "/home/unitree/桌面/label_task/galaxea_subtask_label/part1_r1_lite/results_cleaned.json"
-OUTPUT_DIR = "/home/unitree/桌面/label_task/opt"
+VIDEO_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/episode_videos/head"
+ORIG_META_PATH = "/home/unitree/桌面/VLM-SubtaskLabeling/galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl"
+OUTPUT_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/opt"
 
 
 # ==========================
 # 工具函数
 # ==========================
+def get_file_signature(path: str) -> Tuple[float, int]:
+    """Return (mtime, size) for cache invalidation."""
+    try:
+        stat_res = os.stat(path)
+        return stat_res.st_mtime, stat_res.st_size
+    except FileNotFoundError:
+        return 0.0, 0
+
+
+@st.cache_data(show_spinner=False)
+def build_jsonl_index(meta_path: str, signature: Tuple[float, int]) -> Dict[str, int]:
+    """Build an index that maps candidate keys to byte offsets inside the JSONL file."""
+    if signature == (0.0, 0):
+        return {}
+
+    index: Dict[str, int] = {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                key = record.get("key")
+                data = record.get("data")
+
+                if isinstance(key, str):
+                    index.setdefault(key, offset)
+
+                if isinstance(data, dict):
+                    episode_id = data.get("episode_id")
+                    if isinstance(episode_id, str):
+                        index.setdefault(episode_id, offset)
+    except FileNotFoundError:
+        return {}
+
+    return index
+
+
+def read_jsonl_entry(meta_path: str, index: Dict[str, int], key: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single entry from JSONL via the offset index."""
+    if not key:
+        return None
+
+    offset = index.get(key)
+    if offset is None:
+        return None
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            line = f.readline()
+        record = json.loads(line)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    data = record.get("data") if isinstance(record, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def natural_sort_key(s: str) -> List:
+    """
+    自然排序的 key 函数，让 ep1, ep2, ..., ep10, ep100 按数字顺序排列
+    """
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
+
 def list_videos(video_dir: str) -> Dict[str, str]:
     if not os.path.isdir(video_dir):
         return {}
-    files = sorted(glob.glob(os.path.join(video_dir, "*.mp4")))
+    files = glob.glob(os.path.join(video_dir, "*.mp4"))
+    # 按自然数顺序排序
+    files = sorted(files, key=lambda x: natural_sort_key(os.path.basename(x)))
     mapping = {}
     for f in files:
         eid = os.path.splitext(os.path.basename(f))[0]
@@ -130,49 +206,92 @@ def save_episode_meta(meta: Dict[str, Any], output_dir: str):
         st.error(f"保存失败: {e}")
 
 
+def normalize_steps(steps: List[Dict[str, Any]], frame_count: int) -> List[Dict[str, Any]]:
+    """
+    标准化 steps，确保每个 step 都有 start_frame 和 end_frame
+    - 如果缺少 start_frame，使用 0
+    - 如果缺少 end_frame，使用视频最后一帧 (frame_count - 1)
+    - 不限制已有的帧号范围（因为 frame_count 可能不准确）
+    """
+    normalized = []
+    max_frame = max(frame_count - 1, 0)
+    
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        
+        # 获取或设置默认值
+        start_frame = step.get("start_frame")
+        end_frame = step.get("end_frame")
+        
+        # 处理 start_frame：缺失时使用 0
+        if start_frame is None or start_frame == "":
+            start_frame = 0
+        else:
+            try:
+                start_frame = int(start_frame)
+            except (ValueError, TypeError):
+                start_frame = 0
+        
+        # 处理 end_frame：缺失时使用 max_frame
+        if end_frame is None or end_frame == "":
+            end_frame = max_frame
+        else:
+            try:
+                end_frame = int(end_frame)
+            except (ValueError, TypeError):
+                end_frame = max_frame
+        
+        # 确保 start_frame >= 0
+        start_frame = max(0, start_frame)
+        
+        # 确保 end_frame >= start_frame（但不限制上限）
+        if end_frame < start_frame:
+            # 如果 end_frame 小于 start_frame，使用默认值
+            end_frame = max_frame
+        
+        normalized.append({
+            "step_description": step.get("step_description", ""),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        })
+    
+    return normalized
+
+
 def load_episode_from_original_meta(episode_id: str, meta_path: str):
     if not os.path.exists(meta_path):
         return {}
 
-    try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        st.error(f"读取原始标注文件失败: {e}")
+    signature = get_file_signature(meta_path)
+    index = build_jsonl_index(meta_path, signature)
+    if not index:
         return {}
 
+    candidates: List[str] = []
+
+    def add_candidate(value: Any):
+        if isinstance(value, str) and value and value not in candidates:
+            candidates.append(value)
+
+    add_candidate(episode_id)
+
+    try:
+        num_part = re.findall(r"\d+", episode_id)
+        if num_part:
+            episode_num = int(num_part[-1])
+            prefix = os.path.basename(os.path.dirname(meta_path))
+            add_candidate(f"{prefix}_ep{episode_num}")
+            add_candidate(f"episode_{episode_num:06d}")
+            add_candidate(f"episode_{episode_num}")
+    except (ValueError, TypeError, IndexError):
+        pass
+
     entry = None
-    if isinstance(data, dict):
-        # 1. 尝试直接用 episode_id 匹配 (e.g., "part1_r1_lite_ep10")
-        entry = data.get(episode_id)
-
-        # 2. 如果直接匹配失败，尝试构建几种可能的 key
-        if entry is None:
-            try:
-                # 从 episode_id 中提取最后的数字
-                num_part = re.findall(r'\d+', episode_id)
-                if num_part:
-                    episode_num = int(num_part[-1])
-                    
-                    # 尝试 key A: "part1_r1_lite_ep10" 格式
-                    prefix = os.path.basename(os.path.dirname(meta_path))
-                    key1 = f"{prefix}_ep{episode_num}"
-                    if key1 != episode_id:
-                        entry = data.get(key1)
-
-                    # 尝试 key B: "episode_000010" 格式
-                    if entry is None:
-                        key2 = f"episode_{episode_num:06d}"
-                        if key2 != episode_id:
-                            entry = data.get(key2)
-            except (ValueError, TypeError, IndexError):
-                pass  # 如果解析或构建 key 失败，则忽略
-    
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict) and item.get("episode_id") == episode_id:
-                entry = item
-                break
+    for candidate in candidates:
+        entry = read_jsonl_entry(meta_path, index, candidate)
+        if entry:
+            break
 
     if entry is None:
         return {}
@@ -190,6 +309,10 @@ def load_episode_from_original_meta(episode_id: str, meta_path: str):
     else:
         result = result_raw
 
+    # 不在这里标准化 steps，因为 frame_count 可能不准确
+    # 标准化将在主程序中、获取真实视频帧数后进行
+    raw_steps = result.get("steps", [])
+
     return {
         "episode_id": episode_id,
         "task": task,
@@ -197,7 +320,7 @@ def load_episode_from_original_meta(episode_id: str, meta_path: str):
         "video_path": video_path,
         "result": {
             "task_summary": result.get("task_summary", ""),
-            "steps": result.get("steps", []),
+            "steps": raw_steps,
         },
     }
 
@@ -249,9 +372,27 @@ def load_episode_meta(episode_id: str, meta_path: str, output_dir: str):
 
 
 def get_current_step(steps, frame):
+    """
+    根据当前帧号查找对应的 step
+    增强鲁棒性：处理缺失 start_frame 或 end_frame 的情况
+    """
     for idx, s in enumerate(steps):
         try:
-            if int(s.get("start_frame", 0)) <= frame <= int(s.get("end_frame", -1)):
+            start_frame = s.get("start_frame", 0)
+            end_frame = s.get("end_frame", -1)
+            
+            # 处理可能的非数字类型
+            if start_frame is None or start_frame == "":
+                start_frame = 0
+            else:
+                start_frame = int(start_frame)
+            
+            if end_frame is None or end_frame == "":
+                end_frame = float('inf')  # 如果没有 end_frame，认为到视频结束
+            else:
+                end_frame = int(end_frame)
+            
+            if start_frame <= frame <= end_frame:
                 return idx, s
         except Exception:
             pass
@@ -262,18 +403,155 @@ def classify_episodes(video_ids: List[str], meta_path: str, output_dir: str) -> 
     """
     分类视频：未标注、已标注
     返回: (unannotated_list, annotated_list)
+    
+    优化版：只检查 output_dir 中是否存在对应的 .json 文件，不加载元数据
     """
     unannotated = []
     annotated = []
     
     for episode_id in video_ids:
-        _, status = load_episode_meta(episode_id, meta_path, output_dir)
-        if status == "annotated":
+        output_path = os.path.join(output_dir, f"{episode_id}.json")
+        if os.path.exists(output_path):
             annotated.append(episode_id)
         else:
             unannotated.append(episode_id)
     
     return unannotated, annotated
+
+
+def create_chunks(items: List[str], chunk_size: int = 50) -> Dict[str, List[str]]:
+    """
+    将列表分块，返回 {chunk_label: [items...]}
+    """
+    chunks = {}
+    for i in range(0, len(items), chunk_size):
+        chunk_items = items[i:i + chunk_size]
+        start_idx = i + 1
+        end_idx = min(i + chunk_size, len(items))
+        chunk_label = f"Chunk {start_idx}-{end_idx} ({len(chunk_items)} 个)"
+        chunks[chunk_label] = chunk_items
+    return chunks
+
+
+def get_chunk_labels(total_count: int, chunk_size: int = 50) -> List[str]:
+    """
+    只生成块标签列表，不实际分割数据（懒加载用）
+    """
+    labels = []
+    for i in range(0, total_count, chunk_size):
+        start_idx = i + 1
+        end_idx = min(i + chunk_size, total_count)
+        count = end_idx - start_idx + 1
+        labels.append(f"Chunk {start_idx}-{end_idx} ({count} 个)")
+    return labels
+
+
+def get_chunk_labels_with_annotation_count(all_episode_ids: List[str], unannotated: List[str], chunk_size: int = 50) -> List[str]:
+    """
+    根据原始完整列表生成块标签，显示每个块中未标注的数量
+    all_episode_ids: 所有视频的完整列表（原始顺序）
+    unannotated: 未标注的视频列表
+    """
+    unannotated_set = set(unannotated)
+    labels = []
+    
+    for i in range(0, len(all_episode_ids), chunk_size):
+        start_idx = i + 1
+        end_idx = min(i + chunk_size, len(all_episode_ids))
+        chunk_items = all_episode_ids[i:i + chunk_size]
+        
+        # 计算这个块中未标注的数量
+        unannotated_count = sum(1 for ep_id in chunk_items if ep_id in unannotated_set)
+        
+        # 只有当这个chunk中有未标注的视频时才添加
+        if unannotated_count > 0:
+            labels.append(f"Chunk {start_idx}-{end_idx} ({unannotated_count} 个)")
+    
+    return labels
+
+
+def get_annotated_chunk_labels_with_source(all_episode_ids: List[str], annotated: List[str], chunk_size: int = 50) -> List[str]:
+    """
+    根据原始完整列表生成块标签，显示每个块中已标注的数量
+    all_episode_ids: 所有视频的完整列表（原始顺序）
+    annotated: 已标注的视频列表
+    """
+    annotated_set = set(annotated)
+    labels = []
+    
+    for i in range(0, len(all_episode_ids), chunk_size):
+        start_idx = i + 1
+        end_idx = min(i + chunk_size, len(all_episode_ids))
+        chunk_items = all_episode_ids[i:i + chunk_size]
+        
+        # 计算这个块中已标注的数量
+        annotated_count = sum(1 for ep_id in chunk_items if ep_id in annotated_set)
+        
+        # 只有当这个chunk中有已标注的视频时才添加
+        if annotated_count > 0:
+            labels.append(f"Chunk {start_idx}-{end_idx} ({annotated_count} 个)")
+    
+    return labels
+
+
+def get_chunk_items(items: List[str], chunk_label: str, chunk_size: int = 50) -> List[str]:
+    """
+    根据块标签提取对应的项目（懒加载用）
+    """
+    # 从标签中解析起始索引，如 "Chunk 1-50 (50 个)" -> 1
+    match = re.match(r'Chunk (\d+)-', chunk_label)
+    if not match:
+        return []
+    
+    start_idx = int(match.group(1)) - 1  # 转为 0-based index
+    return items[start_idx:start_idx + chunk_size]
+
+
+def get_unannotated_chunk_items(all_episode_ids: List[str], unannotated: List[str], chunk_label: str, chunk_size: int = 50) -> List[str]:
+    """
+    根据块标签从原始列表中提取该chunk中未标注的视频
+    all_episode_ids: 所有视频的完整列表（原始顺序）
+    unannotated: 未标注的视频列表
+    """
+    # 从标签中解析起始索引，如 "Chunk 1-50 (49 个)" -> 1
+    match = re.match(r'Chunk (\d+)-', chunk_label)
+    if not match:
+        return []
+    
+    start_idx = int(match.group(1)) - 1  # 转为 0-based index
+    chunk_items = all_episode_ids[start_idx:start_idx + chunk_size]
+    
+    # 只返回未标注的
+    unannotated_set = set(unannotated)
+    return [ep_id for ep_id in chunk_items if ep_id in unannotated_set]
+
+
+def get_annotated_chunk_items_with_source(all_episode_ids: List[str], annotated: List[str], chunk_label: str, chunk_size: int = 50) -> List[Tuple[str, str]]:
+    """
+    根据块标签从原始列表中提取该chunk中已标注的视频，并附带原始chunk信息
+    all_episode_ids: 所有视频的完整列表（原始顺序）
+    annotated: 已标注的视频列表
+    返回: [(episode_id, "原Chunk X-Y"), ...]
+    """
+    # 从标签中解析起始索引
+    match = re.match(r'Chunk (\d+)-', chunk_label)
+    if not match:
+        return []
+    
+    start_idx = int(match.group(1)) - 1  # 转为 0-based index
+    end_idx = int(re.search(r'-(\d+)', chunk_label).group(1))
+    chunk_items = all_episode_ids[start_idx:start_idx + chunk_size]
+    
+    # 只返回已标注的
+    annotated_set = set(annotated)
+    result = []
+    for ep_id in chunk_items:
+        if ep_id in annotated_set:
+            # 显示当前chunk信息
+            source_info = f"原Chunk {start_idx + 1}-{end_idx}"
+            result.append((ep_id, source_info))
+    
+    return result
 
 
 # ==========================
@@ -287,7 +565,9 @@ def main():
     # 在创建 widgets 之前，检查是否需要重置状态
     if st.session_state.get("_reset_selection", False):
         # 初始化下拉框的默认值，使其显示 "--- 选择 ---"
+        st.session_state["select_unannotated_chunk"] = "--- 选择 ---"
         st.session_state["select_unannotated"] = "--- 选择 ---"
+        st.session_state["select_annotated_chunk"] = "--- 选择 ---"
         st.session_state["select_annotated"] = "--- 选择 ---"
         st.session_state["_reset_selection"] = False
 
@@ -296,6 +576,7 @@ def main():
     VIDEO_DIR_LOCAL = st.sidebar.text_input("视频目录 VIDEO_DIR", value=VIDEO_DIR)
     ORIG_META_PATH_LOCAL = st.sidebar.text_input("原始总标注 JSON 路径", value=ORIG_META_PATH)
     OUTPUT_DIR_LOCAL = st.sidebar.text_input("输出目录 OUTPUT_DIR", value=OUTPUT_DIR)
+    CHUNK_SIZE = st.sidebar.number_input("每块视频数量", min_value=10, max_value=500, value=50, step=10)
 
     video_mapping = list_videos(VIDEO_DIR_LOCAL)
     if not video_mapping:
@@ -304,8 +585,12 @@ def main():
 
     episode_ids = list(video_mapping.keys())
     
-    # 分类视频
+    # 分类视频（优化版：只检查文件是否存在，不加载元数据）
     unannotated, annotated = classify_episodes(episode_ids, ORIG_META_PATH_LOCAL, OUTPUT_DIR_LOCAL)
+    
+    # 生成块标签（按原始列表位置分chunk）
+    unannotated_chunk_labels = get_chunk_labels_with_annotation_count(episode_ids, unannotated, chunk_size=CHUNK_SIZE)
+    annotated_chunk_labels = get_annotated_chunk_labels_with_source(episode_ids, annotated, chunk_size=CHUNK_SIZE)
     
     st.subheader("📋 选择要标注的视频")
     
@@ -316,35 +601,79 @@ def main():
     with stat_col2:
         st.metric("已经标注的", len(annotated))
     
-    # 两栏下拉框
+    # 两栏下拉框（分块 + 视频）
     select_col1, select_col2 = st.columns(2)
     
     selected_episode = None
     current_status = None
     
     with select_col1:
-        if unannotated:
-            selected_from_unannotated = st.selectbox("📝 未标注的", ["--- 选择 ---"] + unannotated, key="select_unannotated")
-            if selected_from_unannotated != "--- 选择 ---":
-                selected_episode = selected_from_unannotated
-                current_status = "new"
-                # 清空已标注的选择，保持互斥
-                if st.session_state.get("select_annotated") != "--- 选择 ---":
-                    st.session_state["select_annotated"] = "--- 选择 ---"
+        st.markdown("##### 📝 未标注的")
+        if unannotated_chunk_labels:
+            # 第一层：选择块
+            chunk_labels_unannotated = ["--- 选择块 ---"] + unannotated_chunk_labels
+            selected_chunk_unannotated = st.selectbox(
+                "1️⃣ 选择块", 
+                chunk_labels_unannotated, 
+                key="select_unannotated_chunk"
+            )
+            
+            # 第二层：选择具体视频（懒加载：只在选择块后才提取数据）
+            if selected_chunk_unannotated != "--- 选择块 ---":
+                chunk_videos = get_unannotated_chunk_items(episode_ids, unannotated, selected_chunk_unannotated, chunk_size=CHUNK_SIZE)
+                selected_from_unannotated = st.selectbox(
+                    "2️⃣ 选择视频", 
+                    ["--- 选择 ---"] + chunk_videos, 
+                    key="select_unannotated"
+                )
+                if selected_from_unannotated != "--- 选择 ---":
+                    selected_episode = selected_from_unannotated
+                    current_status = "new"
+                    # 清空已标注的选择，保持互斥
+                    if st.session_state.get("select_annotated") != "--- 选择 ---":
+                        st.session_state["select_annotated_chunk"] = "--- 选择块 ---"
+                        st.session_state["select_annotated"] = "--- 选择 ---"
+            else:
+                st.info("👆 请先选择一个块")
         else:
             st.write("（无未标注的）")
     
     with select_col2:
-        if annotated:
-            selected_from_annotated = st.selectbox("✅ 已经标注的", ["--- 选择 ---"] + annotated, key="select_annotated")
-            if selected_from_annotated != "--- 选择 ---":
-                # 只有在未标注的没有选择时才生效
-                if selected_episode is None:
-                    selected_episode = selected_from_annotated
-                    current_status = "annotated"
-                else:
-                    # 如果未标注的已有选择，将已标注的重置为"--- 选择 ---"
-                    st.session_state["select_annotated"] = "--- 选择 ---"
+        st.markdown("##### ✅ 已经标注的")
+        if annotated_chunk_labels:
+            # 第一层：选择块
+            chunk_labels_annotated = ["--- 选择块 ---"] + annotated_chunk_labels
+            selected_chunk_annotated = st.selectbox(
+                "1️⃣ 选择块", 
+                chunk_labels_annotated, 
+                key="select_annotated_chunk"
+            )
+            
+            # 第二层：选择具体视频（懒加载：只在选择块后才提取数据）
+            if selected_chunk_annotated != "--- 选择块 ---":
+                chunk_videos_with_source = get_annotated_chunk_items_with_source(
+                    episode_ids, annotated, selected_chunk_annotated, chunk_size=CHUNK_SIZE
+                )
+                # 创建显示选项，格式: "episode_id (原Chunk X-Y)"
+                video_options = ["--- 选择 ---"] + [f"{ep_id} ({source})" for ep_id, source in chunk_videos_with_source]
+                selected_from_annotated = st.selectbox(
+                    "2️⃣ 选择视频", 
+                    video_options, 
+                    key="select_annotated"
+                )
+                if selected_from_annotated != "--- 选择 ---":
+                    # 提取实际的 episode_id（去掉来源信息）
+                    actual_episode_id = selected_from_annotated.split(" (")[0]
+                    # 只有在未标注的没有选择时才生效
+                    if selected_episode is None:
+                        selected_episode = actual_episode_id
+                        current_status = "annotated"
+                    else:
+                        # 如果未标注的已有选择，将已标注的重置为"--- 选择 ---"
+                        st.session_state["select_annotated_chunk"] = "--- 选择块 ---"
+                        st.session_state["select_annotated"] = "--- 选择 ---"
+            else:
+                st.info("👆 请先选择一个块")
         else:
             st.write("（无已标注的）")
     
@@ -387,6 +716,9 @@ def main():
     result = meta.get("result", {})
     task_summary = result.get("task_summary", meta.get("task", ""))
     original_steps = result.get("steps", [])
+    
+    # 标准化 steps（使用真实的视频帧数）
+    original_steps = normalize_steps(original_steps, frame_count)
 
     # 如果没有 steps 且 frame_count > 0，创建默认 step
     if not original_steps and frame_count > 0:
@@ -415,12 +747,22 @@ def main():
         if start_key in st.session_state:
             start = st.session_state[start_key]
         else:
-            start = int(base.get("start_frame", 0))
+            # 增强鲁棒性：处理缺失或非数字的 start_frame
+            start_raw = base.get("start_frame", 0)
+            try:
+                start = int(start_raw) if start_raw not in (None, "") else 0
+            except (ValueError, TypeError):
+                start = 0
         
         if end_key in st.session_state:
             end = st.session_state[end_key]
         else:
-            end = int(base.get("end_frame", frame_count - 1))
+            # 增强鲁棒性：处理缺失或非数字的 end_frame
+            end_raw = base.get("end_frame")
+            try:
+                end = int(end_raw) if end_raw not in (None, "") else (frame_count - 1)
+            except (ValueError, TypeError):
+                end = frame_count - 1
         
         current_steps.append({
             "step_description": desc,
