@@ -39,7 +39,6 @@ def preprocess_json_file(input_path: Path, output_path: Path):
         except json.JSONDecodeError as e:
             print(f"错误：无法解析输入的 JSON 文件。请检查文件格式。 {e}")
             return
-
     cleaned_data = {}
     for key, value in data.items():
         if isinstance(value, dict):
@@ -81,9 +80,15 @@ def preprocess_json_file(input_path: Path, output_path: Path):
     # 确保输出目录存在
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    print(f"正在将清理后的数据保存到 {output_path}...")
+    print(f"正在将清理后的数据保存到 {output_path} (JSONL 格式)...")
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(cleaned_data, f, indent=2, ensure_ascii=False)
+        # 将每个任务写成独立的 JSON 行，便于后续流式处理
+        for key, entry in cleaned_data.items():
+            json_line = {
+                "key": key,
+                "data": entry,
+            }
+            f.write(json.dumps(json_line, ensure_ascii=False) + '\n')
     
     print(f"✅ 预处理完成！已生成干净的数据文件。")
 
@@ -102,8 +107,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--output', 
         type=str, 
-        default='galaxea_subtask_label/part1_r1_lite/results_cleaned.json',
-        help='保存清理后数据的 JSON 文件路径。'
+        default='galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl',
+        help='保存清理后数据的 JSONL 文件路径。'
     )
     args = parser.parse_args()
 
