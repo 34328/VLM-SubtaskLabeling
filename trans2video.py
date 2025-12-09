@@ -6,7 +6,9 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import tensorflow as tf
-
+import tensorflow_datasets as tfds
+# Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
+tf.config.set_visible_devices([], "GPU")
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='Convert TFRecord to videos')
@@ -45,7 +47,7 @@ feature_description = {
 }
 
 
-# 3) 解析 episode（取三路 RGB 头/左右腕）
+# 3) 解析 episode（返回原始字节数据，不解码）
 def parse_episode(raw):
     ex = tf.io.parse_single_example(raw, feature_description)
 
@@ -58,40 +60,35 @@ def parse_episode(raw):
 
     instr = lang[0].decode("utf-8")
 
-    # 小工具：解码一整条序列的 JPEG 图像
-    def decode_rgb_sequence(varname):
-        bytes_arr = tf.sparse.to_dense(ex[varname]).numpy()
-        frames = []
-        for b in bytes_arr:
-            img = tf.io.decode_jpeg(b)  # (H,W,3) uint8
-            frames.append(img.numpy())
-        return frames
-
-    frames_head = decode_rgb_sequence("steps/observation/image_camera_head")
-    frames_wl = decode_rgb_sequence("steps/observation/image_camera_wrist_left")
-    frames_wr = decode_rgb_sequence("steps/observation/image_camera_wrist_right")
+    # 获取原始 JPEG 字节数据（不解码，节省内存）
+    frames_head_bytes = tf.sparse.to_dense(ex["steps/observation/image_camera_head"]).numpy()
+    frames_wl_bytes = tf.sparse.to_dense(ex["steps/observation/image_camera_wrist_left"]).numpy()
+    frames_wr_bytes = tf.sparse.to_dense(ex["steps/observation/image_camera_wrist_right"]).numpy()
 
     # 安全起见：取三路里最小的长度作为本 episode 的有效帧数
-    T_effective = min(len(frames_head), len(frames_wl), len(frames_wr), T)
+    T_effective = min(len(frames_head_bytes), len(frames_wl_bytes), len(frames_wr_bytes), T)
 
-    frames = {
-        "head": frames_head[:T_effective],
-        "wrist_left": frames_wl[:T_effective],
-        "wrist_right": frames_wr[:T_effective],
+    frames_bytes = {
+        "head": frames_head_bytes[:T_effective],
+        "wrist_left": frames_wl_bytes[:T_effective],
+        "wrist_right": frames_wr_bytes[:T_effective],
     }
 
-    return frames, instr, T_effective
+    return frames_bytes, instr, T_effective
 
 
 # 4) 遍历 shard 中的 episodes
-raw_ds = tf.data.TFRecordDataset(shard_path)
+builder = tfds.builder_from_directory(os.path.join(args.shard_path, "1.0.0"))
+raw_ds = builder.as_dataset(split="train", shuffle_files=False)
+
+# raw_ds = raw_ds.prefetch(tf.data.AUTOTUNE)
 
 print("开始解析并导出视频...")
 
 for ep_idx, raw in tqdm(enumerate(raw_ds), desc="Episodes"):
-    frames, instr, T = parse_episode(raw)
+    frames_bytes, instr, T = parse_episode(raw)
 
-    if frames is None or T == 0:
+    if frames_bytes is None or T == 0:
         tqdm.write(f"[WARN] Episode {ep_idx}: 没有有效帧，跳过")
         continue
 
@@ -101,17 +98,18 @@ for ep_idx, raw in tqdm(enumerate(raw_ds), desc="Episodes"):
     # 基础文件名（3 个相机共用同一个前缀）
     base_name = f"part1_r1_lite_ep{ep_idx}"
 
-    # 对每路相机都生成一个 mp4
-    for cam_key, cam_frames in frames.items():
-        if len(cam_frames) == 0:
+    # 对每路相机都生成一个 mp4（逐个处理相机，避免同时占用内存）
+    for cam_key, cam_frame_bytes in frames_bytes.items():
+        if len(cam_frame_bytes) == 0:
             tqdm.write(f"[WARN] Episode {ep_idx} 相机 {cam_key} 无帧，跳过")
             continue
 
         # 视频存放路径
         video_path = os.path.join(cam_dirs[cam_key], base_name + ".mp4")
 
-        # OpenCV 视频写入器
-        h, w, _ = cam_frames[0].shape
+        # 先解码第一帧获取视频尺寸
+        first_frame = tf.io.decode_jpeg(cam_frame_bytes[0]).numpy()
+        h, w, _ = first_frame.shape
         fps = 30
         fourcc = cv2.VideoWriter_fourcc(*'H264')
 
@@ -122,11 +120,22 @@ for ep_idx, raw in tqdm(enumerate(raw_ds), desc="Episodes"):
             (w, h),
         )
 
-        for frame in cam_frames:
+        # 逐帧解码并写入（避免一次性加载所有帧）
+        for frame_bytes in cam_frame_bytes:
+            # 解码单帧
+            frame = tf.io.decode_jpeg(frame_bytes).numpy()
             # cv2 使用 BGR
             frame_bgr = frame[:, :, ::-1]
             writer.write(frame_bgr)
+            # 显式删除以释放内存
+            del frame, frame_bgr
 
         writer.release()
+        
+        # 释放当前相机的字节数据
+        del cam_frame_bytes
+
+    # 释放整个 episode 的数据
+    del frames_bytes
 
 print("全部视频生成完毕！输出目录：", output_dir)
