@@ -21,9 +21,9 @@ except ImportError:
 # ==========================
 # 默认配置（可被 sidebar 覆盖）
 # ==========================
-VIDEO_DIR = "/home/unitree/桌面/label_task/episode_videos/head"
-ORIG_META_PATH = "/home/unitree/桌面/label_task/galaxea_subtask_label/part1_r1_lite/results_cleaned.json"
-OUTPUT_DIR = "/home/unitree/桌面/label_task/opt"
+VIDEO_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/part2_r1_lite/head"
+ORIG_META_PATH = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite/results_clearned.jsonl"
+OUTPUT_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite//opt"
 
 
 # ==========================
@@ -767,7 +767,7 @@ def main():
         current_steps.append({
             "step_description": desc,
             "start_frame": int(start),
-            "end_frame": int(end),
+            "end_frame": int(end) if i < num_steps - 1 else frame_count - 1,
         })
     
     st.markdown("---")
@@ -902,18 +902,57 @@ def main():
 
 
     # Step 编辑区
-    # Step 编辑区
     st.subheader("🧩 子任务 Step 标注（可编辑）")
+    
+    # 初始化 session_state 中的 steps 列表（如果不存在）
+    if f"steps_{selected_episode}" not in st.session_state:
+        st.session_state[f"steps_{selected_episode}"] = current_steps.copy()
+    
+    # 获取当前 episode 的 steps
+    working_steps = st.session_state[f"steps_{selected_episode}"]
+    
+    # 添加新 Step 按钮
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("➕ 新增 Step", disabled=not is_data_valid):
+            # 添加一个新的空 step
+            last_end = working_steps[-1]["end_frame"] if working_steps else 0
+            new_step = {
+                "step_description": "",
+                "start_frame": min(last_end + 1, max(frame_count - 1, 0)),
+                "end_frame": max(frame_count - 1, 0),
+            }
+            working_steps.append(new_step)
+            st.rerun()
+    
     updated_steps = []
 
-    for i, s in enumerate(current_steps):
+    for i, s in enumerate(working_steps):
         # st.markdown(f"#### Step {i + 1}")
         # 左右两列：左侧是表单，右侧是预览视频
         left_col, right_col = st.columns([3, 2])
 
         # ===== 左侧：step_description / start_frame / end_frame（纵向排布）=====
         with left_col:
-            st.markdown(f"<div style='font-size:18px; font-weight:700;'>Step {i+1}</div>", unsafe_allow_html=True)
+            # Step 标题和删除按钮在同一行
+            header_col1, header_col2 = st.columns([4, 1])
+            with header_col1:
+                st.markdown(f"<div style='font-size:18px; font-weight:700;'>Step {i+1}</div>", unsafe_allow_html=True)
+            with header_col2:
+                # 删除按钮（至少保留一个 step）
+                if len(working_steps) > 1:
+                    delete_key = f"delete_{selected_episode}_{i}"
+                    if st.button("🗑️", key=delete_key, disabled=not is_data_valid, help="删除此 Step"):
+                        # 删除当前 step
+                        working_steps.pop(i)
+                        # 清空相关的 session_state
+                        for key in list(st.session_state.keys()):
+                            if key.startswith(f"desc_{selected_episode}_") or \
+                               key.startswith(f"start_{selected_episode}_") or \
+                               key.startswith(f"end_{selected_episode}_"):
+                                del st.session_state[key]
+                        st.rerun()
+            
             desc_key = f"desc_{selected_episode}_{i}"
             start_key = f"start_{selected_episode}_{i}"
             end_key = f"end_{selected_episode}_{i}"
@@ -939,7 +978,7 @@ def main():
                 "end_frame",
                 min_value=0,
                 max_value=max(frame_count - 1, 0),
-                value=s["end_frame"],
+                value=min(s["end_frame"], frame_count - 1),
                 step=1,
                 key=end_key,
                 disabled=not is_data_valid,
@@ -1077,7 +1116,8 @@ def main():
             
             # 清空所有 step 相关的 state
             for key in list(st.session_state.keys()):
-                if key.startswith("desc_") or key.startswith("start_") or key.startswith("end_") or key == "current_frame":
+                if key.startswith("desc_") or key.startswith("start_") or key.startswith("end_") or \
+                   key.startswith("steps_") or key.startswith("delete_") or key == "current_frame":
                     del st.session_state[key]
             
             st.session_state["current_episode"] = None
