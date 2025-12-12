@@ -12,10 +12,29 @@
 
 ## 安装
 
+### 系统依赖
+
+首先需要安装 FFmpeg（用于视频编码）：
+
 ```bash
-conda create -n Labeling python=3.10 tensorflow tqdm numpy opencv ffmpeg  -c conda-forge
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install -y ffmpeg
+
+# 或使用 conda
+conda install -c conda-forge ffmpeg
+```
+
+### Python 依赖
+
+使用 conda 创建 Python 3.12 环境，然后使用 pip 安装所有依赖：
+
+```bash
+# 创建 conda 环境（Python 3.12）
+conda create -n Labeling python=3.12 -y
 conda activate Labeling
-conda install streamlit
+
+# 安装依赖
+pip install -r requirements.txt
 ```
 
 ## 文件说明

@@ -1,0 +1,15 @@
+# VLM SubTask Labeling Tool - Python Dependencies
+
+# Core dependencies
+numpy==2.2.6
+tqdm==4.67.1
+
+# TensorFlow and datasets
+tensorflow==2.19.0
+tensorflow-datasets==4.9.9
+
+# Web application framework
+streamlit==1.52.1
+
+# Image processing (optional, but recommended)
+opencv-python==4.11.0.86
