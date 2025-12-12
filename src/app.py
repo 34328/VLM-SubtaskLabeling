@@ -21,9 +21,9 @@ except ImportError:
 # ==========================
 # 默认配置（可被 sidebar 覆盖）
 # ==========================
-VIDEO_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/episode_videos/head"
-ORIG_META_PATH = "/home/unitree/桌面/VLM-SubtaskLabeling/galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl"
-OUTPUT_DIR = "/home/unitree/桌面/VLM-SubtaskLabeling/opt"
+VIDEO_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/part2_r1_lite/head"
+ORIG_META_PATH = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite/results_clearned.jsonl"
+OUTPUT_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite//opt"
 
 
 # ==========================
@@ -513,6 +513,8 @@ def get_unannotated_chunk_items(all_episode_ids: List[str], unannotated: List[st
     all_episode_ids: 所有视频的完整列表（原始顺序）
     unannotated: 未标注的视频列表
     """
+    if chunk_label is None:
+        return []
     # 从标签中解析起始索引，如 "Chunk 1-50 (49 个)" -> 1
     match = re.match(r'Chunk (\d+)-', chunk_label)
     if not match:
@@ -533,6 +535,8 @@ def get_annotated_chunk_items_with_source(all_episode_ids: List[str], annotated:
     annotated: 已标注的视频列表
     返回: [(episode_id, "原Chunk X-Y"), ...]
     """
+    if chunk_label is None:
+        return []
     # 从标签中解析起始索引
     match = re.match(r'Chunk (\d+)-', chunk_label)
     if not match:
@@ -564,11 +568,11 @@ def main():
 
     # 在创建 widgets 之前，检查是否需要重置状态
     if st.session_state.get("_reset_selection", False):
-        # 初始化下拉框的默认值，使其显示 "--- 选择 ---"
-        st.session_state["select_unannotated_chunk"] = "--- 选择 ---"
-        st.session_state["select_unannotated"] = "--- 选择 ---"
-        st.session_state["select_annotated_chunk"] = "--- 选择 ---"
-        st.session_state["select_annotated"] = "--- 选择 ---"
+        # 初始化下拉框的默认值为 None
+        st.session_state["select_unannotated_chunk"] = None
+        st.session_state["select_unannotated"] = None
+        st.session_state["select_annotated_chunk"] = None
+        st.session_state["select_annotated"] = None
         st.session_state["_reset_selection"] = False
 
     # Sidebar 配置
@@ -592,6 +596,47 @@ def main():
     unannotated_chunk_labels = get_chunk_labels_with_annotation_count(episode_ids, unannotated, chunk_size=CHUNK_SIZE)
     annotated_chunk_labels = get_annotated_chunk_labels_with_source(episode_ids, annotated, chunk_size=CHUNK_SIZE)
     
+    # 处理保存后的跳转逻辑
+    if "_next_episode" in st.session_state and "_next_status" in st.session_state and "_next_chunk" in st.session_state:
+        next_ep = st.session_state["_next_episode"]
+        next_status = st.session_state["_next_status"]
+        next_chunk = st.session_state["_next_chunk"]
+        
+        # 应用跳转（同时设置 chunk 和 episode）
+        if next_status == "new":
+            st.session_state["select_unannotated_chunk"] = next_chunk
+            st.session_state["select_unannotated"] = next_ep
+            # 确保已标注的被重置为 None
+            st.session_state["select_annotated_chunk"] = None
+            st.session_state["select_annotated"] = None
+        elif next_status == "annotated":
+            st.session_state["select_annotated_chunk"] = next_chunk
+            st.session_state["select_annotated"] = next_ep
+            # 确保未标注的被重置为 None
+            st.session_state["select_unannotated_chunk"] = None
+            st.session_state["select_unannotated"] = None
+        
+        # 清除标志
+        del st.session_state["_next_episode"]
+        del st.session_state["_next_status"]
+        del st.session_state["_next_chunk"]
+    
+    # 处理重置到块选择的逻辑
+    if "_reset_to_chunk_selection" in st.session_state and "_reset_status" in st.session_state:
+        reset_status = st.session_state["_reset_status"]
+        
+        # 重置对应的选择为 None
+        if reset_status == "new":
+            st.session_state["select_unannotated_chunk"] = None
+            st.session_state["select_unannotated"] = None
+        elif reset_status == "annotated":
+            st.session_state["select_annotated_chunk"] = None
+            st.session_state["select_annotated"] = None
+        
+        # 清除标志
+        del st.session_state["_reset_to_chunk_selection"]
+        del st.session_state["_reset_status"]
+    
     st.subheader("📋 选择要标注的视频")
     
     # 两栏显示不同状态的统计
@@ -611,28 +656,32 @@ def main():
         st.markdown("##### 📝 未标注的")
         if unannotated_chunk_labels:
             # 第一层：选择块
-            chunk_labels_unannotated = ["--- 选择块 ---"] + unannotated_chunk_labels
+            # chunk_labels_unannotated = ["--- 选择块 ---"] + unannotated_chunk_labels
+            chunk_labels_unannotated = unannotated_chunk_labels
             selected_chunk_unannotated = st.selectbox(
                 "1️⃣ 选择块", 
-                chunk_labels_unannotated, 
+                chunk_labels_unannotated,
+                index=None,
                 key="select_unannotated_chunk"
             )
             
             # 第二层：选择具体视频（懒加载：只在选择块后才提取数据）
-            if selected_chunk_unannotated != "--- 选择块 ---":
+            if selected_chunk_unannotated is not None:
                 chunk_videos = get_unannotated_chunk_items(episode_ids, unannotated, selected_chunk_unannotated, chunk_size=CHUNK_SIZE)
                 selected_from_unannotated = st.selectbox(
                     "2️⃣ 选择视频", 
-                    ["--- 选择 ---"] + chunk_videos, 
+                    # ["--- 选择 ---"] + 
+                    chunk_videos,
+                    index=None,
                     key="select_unannotated"
                 )
-                if selected_from_unannotated != "--- 选择 ---":
+                if selected_from_unannotated is not None:
                     selected_episode = selected_from_unannotated
                     current_status = "new"
                     # 清空已标注的选择，保持互斥
-                    if st.session_state.get("select_annotated") != "--- 选择 ---":
-                        st.session_state["select_annotated_chunk"] = "--- 选择块 ---"
-                        st.session_state["select_annotated"] = "--- 选择 ---"
+                    if st.session_state.get("select_annotated") is not None:
+                        st.session_state["select_annotated_chunk"] = None
+                        st.session_state["select_annotated"] = None
             else:
                 st.info("👆 请先选择一个块")
         else:
@@ -642,26 +691,30 @@ def main():
         st.markdown("##### ✅ 已经标注的")
         if annotated_chunk_labels:
             # 第一层：选择块
-            chunk_labels_annotated = ["--- 选择块 ---"] + annotated_chunk_labels
+            # chunk_labels_annotated = ["--- 选择块 ---"] + annotated_chunk_labels
+            chunk_labels_annotated = annotated_chunk_labels
             selected_chunk_annotated = st.selectbox(
                 "1️⃣ 选择块", 
-                chunk_labels_annotated, 
+                chunk_labels_annotated,
+                index=None,
                 key="select_annotated_chunk"
             )
             
             # 第二层：选择具体视频（懒加载：只在选择块后才提取数据）
-            if selected_chunk_annotated != "--- 选择块 ---":
+            if selected_chunk_annotated is not None:
                 chunk_videos_with_source = get_annotated_chunk_items_with_source(
                     episode_ids, annotated, selected_chunk_annotated, chunk_size=CHUNK_SIZE
                 )
                 # 创建显示选项，格式: "episode_id (原Chunk X-Y)"
-                video_options = ["--- 选择 ---"] + [f"{ep_id} ({source})" for ep_id, source in chunk_videos_with_source]
+                # video_options = ["--- 选择 ---"] + [f"{ep_id} ({source})" for ep_id, source in chunk_videos_with_source]
+                video_options = [f"{ep_id} ({source})" for ep_id, source in chunk_videos_with_source]
                 selected_from_annotated = st.selectbox(
                     "2️⃣ 选择视频", 
-                    video_options, 
+                    video_options,
+                    index=None,
                     key="select_annotated"
                 )
-                if selected_from_annotated != "--- 选择 ---":
+                if selected_from_annotated is not None:
                     # 提取实际的 episode_id（去掉来源信息）
                     actual_episode_id = selected_from_annotated.split(" (")[0]
                     # 只有在未标注的没有选择时才生效
@@ -669,9 +722,9 @@ def main():
                         selected_episode = actual_episode_id
                         current_status = "annotated"
                     else:
-                        # 如果未标注的已有选择，将已标注的重置为"--- 选择 ---"
-                        st.session_state["select_annotated_chunk"] = "--- 选择块 ---"
-                        st.session_state["select_annotated"] = "--- 选择 ---"
+                        # 如果未标注的已有选择，将已标注的重置为 None
+                        st.session_state["select_annotated_chunk"] = None
+                        st.session_state["select_annotated"] = None
             else:
                 st.info("👆 请先选择一个块")
         else:
@@ -767,7 +820,7 @@ def main():
         current_steps.append({
             "step_description": desc,
             "start_frame": int(start),
-            "end_frame": int(end),
+            "end_frame": int(end) if i < num_steps - 1 else frame_count - 1,
         })
     
     st.markdown("---")
@@ -902,18 +955,57 @@ def main():
 
 
     # Step 编辑区
-    # Step 编辑区
     st.subheader("🧩 子任务 Step 标注（可编辑）")
+    
+    # 初始化 session_state 中的 steps 列表（如果不存在）
+    if f"steps_{selected_episode}" not in st.session_state:
+        st.session_state[f"steps_{selected_episode}"] = current_steps.copy()
+    
+    # 获取当前 episode 的 steps
+    working_steps = st.session_state[f"steps_{selected_episode}"]
+    
+    # 添加新 Step 按钮
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("➕ 新增 Step", disabled=not is_data_valid):
+            # 添加一个新的空 step
+            last_end = working_steps[-1]["end_frame"] if working_steps else 0
+            new_step = {
+                "step_description": "",
+                "start_frame": min(last_end + 1, max(frame_count - 1, 0)),
+                "end_frame": max(frame_count - 1, 0),
+            }
+            working_steps.append(new_step)
+            st.rerun()
+    
     updated_steps = []
 
-    for i, s in enumerate(current_steps):
+    for i, s in enumerate(working_steps):
         # st.markdown(f"#### Step {i + 1}")
         # 左右两列：左侧是表单，右侧是预览视频
         left_col, right_col = st.columns([3, 2])
 
         # ===== 左侧：step_description / start_frame / end_frame（纵向排布）=====
         with left_col:
-            st.markdown(f"<div style='font-size:18px; font-weight:700;'>Step {i+1}</div>", unsafe_allow_html=True)
+            # Step 标题和删除按钮在同一行
+            header_col1, header_col2 = st.columns([4, 1])
+            with header_col1:
+                st.markdown(f"<div style='font-size:18px; font-weight:700;'>Step {i+1}</div>", unsafe_allow_html=True)
+            with header_col2:
+                # 删除按钮（至少保留一个 step）
+                if len(working_steps) > 1:
+                    delete_key = f"delete_{selected_episode}_{i}"
+                    if st.button("🗑️", key=delete_key, disabled=not is_data_valid, help="删除此 Step"):
+                        # 删除当前 step
+                        working_steps.pop(i)
+                        # 清空相关的 session_state
+                        for key in list(st.session_state.keys()):
+                            if key.startswith(f"desc_{selected_episode}_") or \
+                               key.startswith(f"start_{selected_episode}_") or \
+                               key.startswith(f"end_{selected_episode}_"):
+                                del st.session_state[key]
+                        st.rerun()
+            
             desc_key = f"desc_{selected_episode}_{i}"
             start_key = f"start_{selected_episode}_{i}"
             end_key = f"end_{selected_episode}_{i}"
@@ -939,7 +1031,7 @@ def main():
                 "end_frame",
                 min_value=0,
                 max_value=max(frame_count - 1, 0),
-                value=s["end_frame"],
+                value=min(s["end_frame"], frame_count - 1),
                 step=1,
                 key=end_key,
                 disabled=not is_data_valid,
@@ -1072,18 +1164,89 @@ def main():
             meta["annotation_status"] = "annotated"
             save_episode_meta(meta, OUTPUT_DIR_LOCAL)
             
-            # 设置重置标志，下次运行时会重置下拉框
-            st.session_state["_reset_selection"] = True
+            # 智能跳转：查找当前块的下一个视频
+            next_episode = None
+            next_episode_display = None
+            
+            # 判断当前选择的是未标注的还是已标注的
+            if current_status == "new":
+                # 从未标注的列表中查找
+                selected_chunk = st.session_state.get("select_unannotated_chunk", None)
+                if selected_chunk is not None:
+                    # 重新获取当前块的视频列表（保存后会变化）
+                    unannotated_new, _ = classify_episodes(episode_ids, ORIG_META_PATH_LOCAL, OUTPUT_DIR_LOCAL)
+                    chunk_videos = get_unannotated_chunk_items(episode_ids, unannotated_new, selected_chunk, chunk_size=CHUNK_SIZE)
+                    
+                    # 找到当前视频在列表中的位置
+                    if selected_episode in chunk_videos:
+                        current_idx = chunk_videos.index(selected_episode)
+                        # 查找下一个视频
+                        if current_idx + 1 < len(chunk_videos):
+                            next_episode = chunk_videos[current_idx + 1]
+                            next_episode_display = next_episode
+                    elif len(chunk_videos) > 0:
+                        # 当前视频已标注，取第一个未标注的
+                        next_episode = chunk_videos[0]
+                        next_episode_display = next_episode
+            
+            elif current_status == "annotated":
+                # 从已标注的列表中查找
+                selected_chunk = st.session_state.get("select_annotated_chunk", None)
+                if selected_chunk is not None:
+                    _, annotated_new = classify_episodes(episode_ids, ORIG_META_PATH_LOCAL, OUTPUT_DIR_LOCAL)
+                    chunk_videos_with_source = get_annotated_chunk_items_with_source(
+                        episode_ids, annotated_new, selected_chunk, chunk_size=CHUNK_SIZE
+                    )
+                    chunk_videos = [ep_id for ep_id, _ in chunk_videos_with_source]
+                    
+                    # 找到当前视频在列表中的位置
+                    if selected_episode in chunk_videos:
+                        current_idx = chunk_videos.index(selected_episode)
+                        # 查找下一个视频
+                        if current_idx + 1 < len(chunk_videos):
+                            next_episode = chunk_videos[current_idx + 1]
+                            # 找到完整的显示字符串
+                            for ep_id, source in chunk_videos_with_source:
+                                if ep_id == next_episode:
+                                    next_episode_display = f"{ep_id} ({source})"
+                                    break
+                    elif len(chunk_videos) > 0:
+                        # 取第一个
+                        next_episode = chunk_videos[0]
+                        for ep_id, source in chunk_videos_with_source:
+                            if ep_id == next_episode:
+                                next_episode_display = f"{ep_id} ({source})"
+                                break
             
             # 清空所有 step 相关的 state
             for key in list(st.session_state.keys()):
-                if key.startswith("desc_") or key.startswith("start_") or key.startswith("end_") or key == "current_frame":
+                if key.startswith("desc_") or key.startswith("start_") or key.startswith("end_") or \
+                   key.startswith("steps_") or key.startswith("delete_") or key == "current_frame":
                     del st.session_state[key]
             
-            st.session_state["current_episode"] = None
+            # 根据是否有下一个视频，决定跳转策略
+            # 使用 _next_episode、_next_chunk 和 _next_status 作为标志，在 rerun 后应用
+            if next_episode:
+                # 有下一个视频，设置标志位（包括 chunk 选择）
+                st.session_state["_next_episode"] = next_episode_display
+                st.session_state["_next_status"] = current_status
+                # 保存当前的 chunk 选择
+                if current_status == "new":
+                    st.session_state["_next_chunk"] = st.session_state.get("select_unannotated_chunk", None)
+                elif current_status == "annotated":
+                    st.session_state["_next_chunk"] = st.session_state.get("select_annotated_chunk", None)
+                
+                st.session_state["current_episode"] = None  # 重置，下次会重新加载
+                st.success(f"✅ 保存成功！正在跳转到下一个视频：{next_episode}")
+            else:
+                # 当前块没有更多视频，设置重置标志
+                st.session_state["_reset_to_chunk_selection"] = True
+                st.session_state["_reset_status"] = current_status
+                st.session_state["current_episode"] = None
+                st.success("✅ 保存成功！当前块已完成，请选择新的块继续标注。")
             
             time.sleep(1)
-            st.rerun()  # 保存后自动刷新，重置所有状态
+            st.rerun()  # 保存后自动刷新
 
 
 if __name__ == "__main__":

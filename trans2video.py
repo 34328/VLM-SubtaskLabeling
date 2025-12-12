@@ -1,12 +1,14 @@
 
 import os
-import cv2
 import argparse
+import subprocess
 
 import numpy as np
 from tqdm import tqdm
 import tensorflow as tf
-
+import tensorflow_datasets as tfds
+# Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
+tf.config.set_visible_devices([], "GPU")
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='Convert TFRecord to videos')
@@ -36,97 +38,123 @@ cam_dirs = {
 for d in cam_dirs.values():
     os.makedirs(d, exist_ok=True)
 
-# 2) 定义 TFRecord feature 结构（解析三路 RGB + 指令）
-feature_description = {
-    "steps/observation/image_camera_head": tf.io.VarLenFeature(tf.string),
-    "steps/observation/image_camera_wrist_left": tf.io.VarLenFeature(tf.string),
-    "steps/observation/image_camera_wrist_right": tf.io.VarLenFeature(tf.string),
-    "steps/language_instruction": tf.io.VarLenFeature(tf.string),
-}
+# 2) 解析 episode（RLDS 格式，返回生成器以节省内存）
+def parse_episode(episode):
+    """
+    解析 RLDS episode，返回迭代器以节省内存
+    Args:
+        episode: RLDS episode 字典，包含 'steps' dataset
+    Returns:
+        instruction, step_count, steps_iterator
+    """
+    # 获取 steps dataset
+    steps = episode['steps']
+    
+    # 获取第一个 step 来提取指令和计数
+    first_step = None
+    step_count = 0
+    for step in steps:
+        if first_step is None:
+            first_step = step
+        step_count += 1
+    
+    if first_step is None or step_count == 0:
+        return None, 0, None
+    
+    # 提取语言指令
+    instr = first_step['language_instruction'].numpy().decode('utf-8')
+    
+    # 重新创建迭代器（因为上面已经消耗了）
+    steps_iter = episode['steps']
+    
+    return instr, step_count, steps_iter
 
 
-# 3) 解析 episode（取三路 RGB 头/左右腕）
-def parse_episode(raw):
-    ex = tf.io.parse_single_example(raw, feature_description)
-
-    # 语言指令（每帧一样）
-    lang = tf.sparse.to_dense(ex["steps/language_instruction"]).numpy()
-    T = len(lang)
-
-    if T == 0:
-        return None, None, 0
-
-    instr = lang[0].decode("utf-8")
-
-    # 小工具：解码一整条序列的 JPEG 图像
-    def decode_rgb_sequence(varname):
-        bytes_arr = tf.sparse.to_dense(ex[varname]).numpy()
-        frames = []
-        for b in bytes_arr:
-            img = tf.io.decode_jpeg(b)  # (H,W,3) uint8
-            frames.append(img.numpy())
-        return frames
-
-    frames_head = decode_rgb_sequence("steps/observation/image_camera_head")
-    frames_wl = decode_rgb_sequence("steps/observation/image_camera_wrist_left")
-    frames_wr = decode_rgb_sequence("steps/observation/image_camera_wrist_right")
-
-    # 安全起见：取三路里最小的长度作为本 episode 的有效帧数
-    T_effective = min(len(frames_head), len(frames_wl), len(frames_wr), T)
-
-    frames = {
-        "head": frames_head[:T_effective],
-        "wrist_left": frames_wl[:T_effective],
-        "wrist_right": frames_wr[:T_effective],
-    }
-
-    return frames, instr, T_effective
-
-
-# 4) 遍历 shard 中的 episodes
-raw_ds = tf.data.TFRecordDataset(shard_path)
+# 3) 遍历 shard 中的 episodes
+builder = tfds.builder_from_directory(os.path.join(args.shard_path, "1.0.0"))
+raw_ds = builder.as_dataset(split="train", shuffle_files=False)
 
 print("开始解析并导出视频...")
 
-for ep_idx, raw in tqdm(enumerate(raw_ds), desc="Episodes"):
-    frames, instr, T = parse_episode(raw)
+for ep_idx, episode in tqdm(enumerate(raw_ds), desc="Episodes"):
+    instr, T, steps_iter = parse_episode(episode)
 
-    if frames is None or T == 0:
+    if steps_iter is None or T == 0:
         tqdm.write(f"[WARN] Episode {ep_idx}: 没有有效帧，跳过")
         continue
 
     # 打印每个 episode 的帧数
-    tqdm.write(f"Episode {ep_idx}: {T} 帧")
+    tqdm.write(f"Episode {ep_idx}: {T} 帧, 指令: {instr}")
 
     # 基础文件名（3 个相机共用同一个前缀）
     base_name = f"part1_r1_lite_ep{ep_idx}"
 
-    # 对每路相机都生成一个 mp4
-    for cam_key, cam_frames in frames.items():
-        if len(cam_frames) == 0:
-            tqdm.write(f"[WARN] Episode {ep_idx} 相机 {cam_key} 无帧，跳过")
-            continue
-
-        # 视频存放路径
-        video_path = os.path.join(cam_dirs[cam_key], base_name + ".mp4")
-
-        # OpenCV 视频写入器
-        h, w, _ = cam_frames[0].shape
-        fps = 30
-        fourcc = cv2.VideoWriter_fourcc(*'H264')
-
-        writer = cv2.VideoWriter(
-            video_path,
-            fourcc,
-            fps,
-            (w, h),
-        )
-
-        for frame in cam_frames:
-            # cv2 使用 BGR
-            frame_bgr = frame[:, :, ::-1]
-            writer.write(frame_bgr)
-
-        writer.release()
+    # 使用 FFmpeg 通过管道写入视频（H.264 编码）
+    ffmpeg_procs = {}
+    video_paths = {}
+    fps = 30
+    
+    # 遍历所有帧
+    first_step = True
+    for step in steps_iter:
+        # 提取三个相机的图像
+        img_head = step['observation']['image_camera_head'].numpy()
+        img_wrist_left = step['observation']['image_camera_wrist_left'].numpy()
+        img_wrist_right = step['observation']['image_camera_wrist_right'].numpy()
+        
+        # 如果是第一帧，初始化 FFmpeg 进程
+        if first_step:
+            for cam_key, img in [('head', img_head), 
+                                  ('wrist_left', img_wrist_left), 
+                                  ('wrist_right', img_wrist_right)]:
+                h, w, _ = img.shape
+                video_path = os.path.join(cam_dirs[cam_key], base_name + ".mp4")
+                video_paths[cam_key] = video_path
+                
+                # 使用 FFmpeg 管道写入，H.264 编码
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-y',  # 覆盖输出文件
+                    '-f', 'rawvideo',
+                    '-vcodec', 'rawvideo',
+                    '-s', f'{w}x{h}',
+                    '-pix_fmt', 'rgb24',
+                    '-r', str(fps),
+                    '-i', '-',  # 从管道读取
+                    '-c:v', 'libx264',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p',
+                    video_path
+                ]
+                
+                proc = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                ffmpeg_procs[cam_key] = proc
+            
+            first_step = False
+        
+        # 写入当前帧到各个视频
+        for cam_key, img in [('head', img_head), 
+                              ('wrist_left', img_wrist_left), 
+                              ('wrist_right', img_wrist_right)]:
+            if cam_key in ffmpeg_procs:
+                # 直接写入 RGB 数据
+                ffmpeg_procs[cam_key].stdin.write(img.astype(np.uint8).tobytes())
+        
+        # 释放当前帧的图像数据
+        del img_head, img_wrist_left, img_wrist_right, step
+    
+    # 关闭所有 FFmpeg 进程
+    for cam_key, proc in ffmpeg_procs.items():
+        proc.stdin.close()
+        proc.wait()
+    
+    # 清理
+    del ffmpeg_procs, video_paths, steps_iter
 
 print("全部视频生成完毕！输出目录：", output_dir)
