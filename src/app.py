@@ -5,6 +5,8 @@ import ast
 import copy
 import re
 import time
+import sys
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 import base64 
@@ -19,11 +21,84 @@ except ImportError:
 
 
 # ==========================
-# 默认配置（可被 sidebar 覆盖）
+# 配置加载函数
 # ==========================
-VIDEO_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/part2_r1_lite/head"
-ORIG_META_PATH = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite/results_clearned.jsonl"
-OUTPUT_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part2_r1_lite//opt"
+def load_config_from_file(config_path: str) -> Optional[Dict[str, Any]]:
+    """从配置文件加载配置"""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        return config
+    except Exception as e:
+        st.error(f"❌ 无法加载配置文件 {config_path}: {e}")
+        return None
+
+
+def get_config_from_args_or_env():
+    """
+    从命令行参数或环境变量获取配置
+    
+    优先级:
+    1. 命令行参数 --config <path>
+    2. 环境变量 ANNOTATOR_ID
+    3. 环境变量 ANNOTATOR_CONFIG
+    4. 默认配置
+    """
+    config = {}
+    
+    # 1. 尝试从命令行参数读取 --config
+    if len(sys.argv) > 1:
+        for i, arg in enumerate(sys.argv):
+            if arg == '--config' and i + 1 < len(sys.argv):
+                config_path = sys.argv[i + 1]
+                loaded_config = load_config_from_file(config_path)
+                if loaded_config:
+                    return loaded_config
+    
+    # 2. 尝试从环境变量 ANNOTATOR_CONFIG 读取
+    annotator_config = os.environ.get('ANNOTATOR_CONFIG')
+    if annotator_config and os.path.exists(annotator_config):
+        loaded_config = load_config_from_file(annotator_config)
+        if loaded_config:
+            return loaded_config
+    
+    # 3. 尝试从环境变量 ANNOTATOR_ID 推导配置
+    annotator_id = os.environ.get('ANNOTATOR_ID')
+    if annotator_id:
+        # 假设工作目录在 multi_annotator_workspace/annotator_N/
+        workspace_root = os.environ.get('WORKSPACE_ROOT', './multi_annotator_workspace')
+        config_path = os.path.join(workspace_root, f'annotator_{annotator_id}', 'config.json')
+        if os.path.exists(config_path):
+            loaded_config = load_config_from_file(config_path)
+            if loaded_config:
+                return loaded_config
+    
+    # 4. 返回空配置，使用默认值
+    return config
+
+
+# 加载配置
+LOADED_CONFIG = get_config_from_args_or_env()
+
+# ==========================
+# 默认配置（可被 config 文件或 sidebar 覆盖）
+# ==========================
+if LOADED_CONFIG:
+    # 从配置文件加载
+    # video_dir 可选，如果没有则从 annotations_file 中读取视频路径
+    VIDEO_DIR = LOADED_CONFIG.get("video_dir", None)
+    ORIG_META_PATH = LOADED_CONFIG.get("annotations_file", "./annotations/tasks.jsonl")
+    OUTPUT_DIR = LOADED_CONFIG.get("output_dir", "./output")
+    ANNOTATOR_ID = LOADED_CONFIG.get("annotator_id", "unknown")
+    WORKSPACE_ROOT = LOADED_CONFIG.get("workspace_root", "/home/jensen/world_model")
+    st.sidebar.success(f"✅ 已加载标注者 {ANNOTATOR_ID} 的配置")
+else:
+    # 使用默认配置
+    VIDEO_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/part1_r1_lite/head"
+    ORIG_META_PATH = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl"
+    OUTPUT_DIR = "/home/jensen/remote_jensen2/Galaxea-Open-World-Dataset-Video/galaxea_subtask_label/part1_r1_lite/opt"
+    ANNOTATOR_ID = None
+    WORKSPACE_ROOT = None
 
 
 # ==========================
@@ -103,17 +178,92 @@ def natural_sort_key(s: str) -> List:
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
 
-def list_videos(video_dir: str) -> Dict[str, str]:
-    if not os.path.isdir(video_dir):
+def list_videos_from_meta(meta_path: str, workspace_root: str = None) -> Dict[str, str]:
+    """
+    从 meta 文件中读取视频路径
+    适用于视频路径已经在 meta 文件中的情况
+    """
+    if not os.path.exists(meta_path):
         return {}
-    files = glob.glob(os.path.join(video_dir, "*.mp4"))
-    # 按自然数顺序排序
-    files = sorted(files, key=lambda x: natural_sort_key(os.path.basename(x)))
+    
     mapping = {}
-    for f in files:
-        eid = os.path.splitext(os.path.basename(f))[0]
-        mapping[eid] = f
+    signature = get_file_signature(meta_path)
+    index = build_jsonl_index(meta_path, signature)
+    
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    key = record.get("key")
+                    data = record.get("data", {})
+                    video_path = data.get("video_path", "")
+                    
+                    if key and video_path:
+                        # 如果是相对路径，拼接 workspace_root
+                        if workspace_root and not os.path.isabs(video_path):
+                            full_path = os.path.join(workspace_root, video_path)
+                        else:
+                            full_path = video_path
+                        
+                        # 检查文件是否存在
+                        if os.path.exists(full_path):
+                            mapping[key] = full_path
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return {}
+    
     return mapping
+
+
+def list_videos(video_dir: str, meta_path: str = None, workspace_root: str = None) -> Dict[str, str]:
+    """
+    列出视频文件
+    优先从 meta 文件读取视频路径，如果失败则从目录扫描
+    
+    支持两种模式:
+    1. 从 meta 文件读取（多标注者模式）
+    2. 从目录扫描（传统模式）
+    """
+    # 模式1: 如果提供了 meta_path，尝试从中读取视频路径
+    if meta_path:
+        mapping = list_videos_from_meta(meta_path, workspace_root)
+        if mapping:
+            return mapping
+    
+    # 模式2: 从目录扫描
+    if not video_dir or not os.path.isdir(video_dir):
+        return {}
+    
+    mapping = {}
+    
+    # 首先尝试扁平结构（直接在 video_dir 下）
+    direct_files = glob.glob(os.path.join(video_dir, "*.mp4"))
+    if direct_files:
+        for f in direct_files:
+            eid = os.path.splitext(os.path.basename(f))[0]
+            mapping[eid] = f
+    
+    # 然后尝试分类结构（video_dir/task_type/*.mp4）
+    for subdir in os.listdir(video_dir):
+        subdir_path = os.path.join(video_dir, subdir)
+        if os.path.isdir(subdir_path):
+            subdir_files = glob.glob(os.path.join(subdir_path, "*.mp4"))
+            for f in subdir_files:
+                # 使用 task_type_episode_id 作为 key，或者只用 episode_id
+                eid = os.path.splitext(os.path.basename(f))[0]
+                # 避免重复的 key
+                if eid in mapping:
+                    eid = f"{subdir}_{eid}"
+                mapping[eid] = f
+    
+    # 按自然数顺序排序（使用 episode ID）
+    sorted_keys = sorted(mapping.keys(), key=natural_sort_key)
+    return {k: mapping[k] for k in sorted_keys}
 
 
 def safe_literal_eval_list(s):
@@ -564,7 +714,11 @@ def get_annotated_chunk_items_with_source(all_episode_ids: List[str], annotated:
 def main():
     st.set_page_config(page_title="视频子任务标注工具", layout="wide")
 
-    st.title("📽️ 视频子任务标注工具（v0.2）")
+    # 显示标题和标注者信息
+    if ANNOTATOR_ID is not None:
+        st.title(f"📽️ 视频子任务标注工具（v0.3） - 标注者 {ANNOTATOR_ID}")
+    else:
+        st.title("📽️ 视频子任务标注工具（v0.3）")
 
     # 在创建 widgets 之前，检查是否需要重置状态
     if st.session_state.get("_reset_selection", False):
@@ -577,12 +731,14 @@ def main():
 
     # Sidebar 配置
     st.sidebar.header("🔧 配置")
-    VIDEO_DIR_LOCAL = st.sidebar.text_input("视频目录 VIDEO_DIR", value=VIDEO_DIR)
+    VIDEO_DIR_LOCAL = st.sidebar.text_input("视频目录 VIDEO_DIR", value=VIDEO_DIR or "")
     ORIG_META_PATH_LOCAL = st.sidebar.text_input("原始总标注 JSON 路径", value=ORIG_META_PATH)
     OUTPUT_DIR_LOCAL = st.sidebar.text_input("输出目录 OUTPUT_DIR", value=OUTPUT_DIR)
     CHUNK_SIZE = st.sidebar.number_input("每块视频数量", min_value=10, max_value=500, value=50, step=10)
 
-    video_mapping = list_videos(VIDEO_DIR_LOCAL)
+    # 优先从 meta 文件读取视频路径，如果失败则从目录扫描
+    WORKSPACE_ROOT_LOCAL = st.sidebar.text_input("工作空间根目录 WORKSPACE_ROOT", value=WORKSPACE_ROOT or "")
+    video_mapping = list_videos(VIDEO_DIR_LOCAL, ORIG_META_PATH_LOCAL, WORKSPACE_ROOT_LOCAL if WORKSPACE_ROOT_LOCAL else None)
     if not video_mapping:
         st.error(f"目录 {VIDEO_DIR_LOCAL} 中没有 mp4 文件")
         return

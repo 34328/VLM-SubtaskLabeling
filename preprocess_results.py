@@ -103,18 +103,57 @@ if __name__ == '__main__':
         '--input', 
         type=str, 
         default='galaxea_subtask_label/part1_r1_lite/results.json',
-        help='输入的 JSON 文件路径。'
+        help='输入的 JSON 文件路径或目录路径（如果是目录，会处理目录下所有 JSON 文件）。'
     )
     parser.add_argument(
         '--output', 
         type=str, 
-        default='galaxea_subtask_label/part1_r1_lite/results_cleaned.jsonl',
-        help='保存清理后数据的 JSONL 文件路径。'
+        default=None,
+        help='保存清理后数据的 JSONL 文件路径或目录（输入是文件时指定文件路径，输入是目录时指定输出目录，必须提供）。'
     )
     args = parser.parse_args()
 
     # 使用 Path 对象处理路径
-    input_file = Path(args.input)
-    output_file = Path(args.output)
-
-    preprocess_json_file(input_file, output_file)
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"错误：输入路径不存在: {input_path}")
+        exit(1)
+    
+    # 如果输入是目录，处理目录下所有 JSON 文件
+    if input_path.is_dir():
+        if args.output is None:
+            print(f"错误：输入是目录时，必须指定 --output 输出目录")
+            exit(1)
+        
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"检测到目录输入，将处理目录下所有 JSON 文件...")
+        json_files = list(input_path.rglob('*.json'))
+        
+        if not json_files:
+            print(f"警告：在目录 {input_path} 下未找到 JSON 文件")
+            exit(1)
+        
+        print(f"找到 {len(json_files)} 个 JSON 文件")
+        print(f"输出目录: {output_dir}")
+        
+        for json_file in json_files:
+            # 计算相对于输入目录的路径，在输出目录中保持相同的目录结构
+            relative_path = json_file.relative_to(input_path)
+            output_file = output_dir / relative_path.with_suffix('.jsonl')
+            print(f"\n处理: {json_file} -> {output_file}")
+            preprocess_json_file(json_file, output_file)
+        
+        print(f"\n✅ 所有文件处理完成！共处理 {len(json_files)} 个文件")
+    
+    # 如果输入是文件，使用原有逻辑
+    else:
+        if args.output is None:
+            # 如果没有指定输出，默认在同目录下生成同名文件，扩展名改为 .jsonl
+            output_file = input_path.with_suffix('.jsonl')
+        else:
+            output_file = Path(args.output)
+        
+        preprocess_json_file(input_path, output_file)

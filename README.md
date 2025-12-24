@@ -105,7 +105,7 @@ python preprocess_results.py \
 ## 运行标注工具
 
 ```bash
-cd ./src && streamlit run app.py
+streamlit run src/app.py -- --config /home/jensen/world_model/unitree_subtask_label/multi_annotator_workspace/annotator_0/config.json --workspace_root /home/jensen/world_model
 ```
 
 ## 注意事项
